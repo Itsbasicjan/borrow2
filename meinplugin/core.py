@@ -4,11 +4,16 @@ from datetime import date, timedelta
 
 from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
+from django.urls import path # Wichtig für setup_urls mit path()
+from django.http import HttpResponse
+from django.template.loader import render_to_string # Zum Rendern des Templates
+from django.shortcuts import redirect # Optional, nach Aktion
 
+# InvenTree imports
 from plugin import InvenTreePlugin
-from plugin.mixins import ActionMixin, SettingsMixin, EventMixin, LocateMixin, PanelMixin, UrlsMixin, AppMixin, NavigationMixin, LabelPrintingMixin, BarcodeMixin, APICallMixin, ScheduleMixin, ReportMixin, ValidationMixin, CurrencyExchangeMixin, IconPackMixin, UserInterfaceMixin
+from plugin.mixins import ActionMixin, UrlsMixin, NavigationMixin # Geändert!
 from stock.models import StockItem
-from inventree.api.serializers import UserSerializer
+from users.models import check_user_role # Für Berechtigungen (Beispiel)
 
 # Setup Logger
 logger = logging.getLogger("inventree")
@@ -18,82 +23,92 @@ METADATA_LOAN_USER_KEY = "loaned_to_user_id"
 METADATA_LOAN_DUE_DATE_KEY = "loan_due_date"
 DEFAULT_LOAN_DURATION_DAYS = 14
 
-class LoanPlugin(InvenTreePlugin, ActionMixin, UserInterfaceMixin):
+class LoanPlugin(InvenTreePlugin, ActionMixin, UrlsMixin, NavigationMixin): # Mixins geändert
     """
-    A plugin to add simple loan functionality to StockItems.
+    A plugin to add simple loan functionality to StockItems via a dedicated page.
     """
 
     NAME = "LoanPlugin"
-    SLUG = "loan"
+    SLUG = "loan" # Wird für URLs und Namensräume verwendet
     TITLE = "Stock Item Loan Management"
-    DESCRIPTION = "Adds actions and UI elements to loan and return stock items."
-    VERSION = "0.2.0"
+    DESCRIPTION = "Adds a dedicated page to loan and return stock items."
+    VERSION = "0.3.0" # Version erhöht
     AUTHOR = "Your Name Here"
 
-    # --- ActionMixin Konfiguration ---
-    # Wir verwenden eine einzige Aktion und unterscheiden über die Daten
+    # --- ActionMixin Konfiguration (bleibt gleich) ---
     ACTION_NAME = "manage_loan"
     ACTION_ARGS = {
         "stock_item_pk": {
              'type': 'integer',
              'label': 'Stock Item ID',
              'required': True,
-             'help_text': 'Primary key of the stock item to manage',
         },
         "loan_action": {
             'type': 'string',
             'label': 'Loan Action',
             'required': True,
             'choices': [('loan', 'Loan Item'), ('return', 'Return Item')],
-            'help_text': 'Specify whether to loan or return the item',
         },
-        # Optional: Könnte für Admin-Override genutzt werden
-        # "target_user_pk": {
-        #     'type': 'integer',
-        #     'label': 'Target User ID',
-        #     'required': False,
-        #     'help_text': 'Specify the user to loan to (optional, requires permission)',
-        # }
     }
 
-    # --- UserInterfaceMixin Methoden ---
-    def get_ui_panels(self, request, context):
+    # --- NavigationMixin Konfiguration ---
+    # Fügt einen Link zum Hauptmenü hinzu
+    NAVIGATION_TAB_NAME = "Loan Management" # Name der Haupt-Navigationsgruppe
+    NAVIGATION_TAB_ICON = "fas fa-hand-holding-box"
+    NAVIGATION = [
+        {
+            'name': 'Loanable Items', # Name des Links
+            'link': 'plugin:loan:loan-list', # URL-Name (plugin:<SLUG>:<url_name>)
+            'icon': 'fas fa-list',
+        }
+    ]
+
+    # --- UrlsMixin Konfiguration ---
+    def setup_urls(self):
         """
-        Inject custom panels into the InvenTree web interface.
+        Definiert die URL-Muster für dieses Plugin.
         """
-        panels = []
+        return [
+            # Die URL für unsere dedizierte Ausleihseite
+            path('loan-list/', self.view_loan_list, name='loan-list'),
+            # Optional: Könnte für AJAX-Updates genutzt werden, aber wir nutzen die Action API
+            # path('status/<int:pk>/', self.view_item_status, name='item-status'),
+        ]
 
-        # Nur auf der StockItem Detailseite anzeigen
-        view = context.get('view', None)
-        if view and view.view_name == 'stock_item_detail':
-            try:
-                item_id = int(context.get('pk', None))
-                item = StockItem.objects.get(pk=item_id)
+    # --- Django View Funktion für die Plugin-Seite ---
+    def view_loan_list(self, request):
+        """
+        Rendert die HTML-Seite, die alle ausleihbaren Items anzeigt.
+        """
+        # Berechtigungsprüfung (Beispiel: Nur eingeloggte Benutzer)
+        if not request.user.is_authenticated:
+            return HttpResponse("Permission Denied", status=403)
 
-                # Hole aktuelle Leihinformationen
-                loan_info = self.get_loan_status(item)
+        # Hole alle StockItems (oder filtere nach Bedarf, z.B. nur bestimmte Kategorien)
+        # Für Performance bei vielen Items: Paginierung hinzufügen!
+        items = StockItem.objects.filter(in_stock=True).select_related('part', 'location') # Performance: Verwandte Objekte mitladen
+        items_data = []
 
-                panels.append({
-                    'key': 'loan-panel',
-                    'title': 'Loan Information',
-                    'icon': 'fas fa-hand-holding-box',
-                    'content': None, # Wird vom Frontend gerendert
-                    'javascript_file': '/static/plugins/loan/loan_panel.js', # Pfad zur JS-Datei
-                    'javascript_function': 'renderLoanPanel', # Name der JS-Funktion
-                    'context': {
-                        'stock_item_pk': item.pk,
-                        'initial_loan_status': loan_info,
-                        'requesting_user_pk': request.user.pk,
-                        'can_manage_stock': request.user.is_staff or request.user.has_perm('stock.change_stockitem') # Beispiel-Berechtigung
-                    }
-                })
-            except Exception as e:
-                logger.error(f"Error injecting loan panel: {e}")
+        for item in items:
+            items_data.append({
+                'item': item,
+                'loan_status': self.get_loan_status(item)
+            })
 
-        return panels
+        # Rendere das Template mit den Daten
+        context = {
+            'plugin': self, # Übergibt das Plugin-Objekt an das Template
+            'items': items_data,
+            'requesting_user_pk': request.user.pk,
+            # Beispiel: Übergebe Berechtigung an Template (kann auch im JS geprüft werden)
+            'can_manage_stock': request.user.is_staff or request.user.has_perm('stock.change_stockitem')
+        }
+        # Wichtig: Der Template-Pfad muss für Django auffindbar sein!
+        html = render_to_string('loan/loan_list.html', context, request=request)
+        return HttpResponse(html)
 
 
-    # --- Hilfsfunktionen ---
+    # --- Hilfsfunktionen (bleiben größtenteils gleich) ---
     def get_loan_status(self, item: StockItem):
         """Gibt den aktuellen Leihstatus des Items zurück."""
         user_id = item.get_metadata(METADATA_LOAN_USER_KEY)
@@ -103,7 +118,6 @@ class LoanPlugin(InvenTreePlugin, ActionMixin, UserInterfaceMixin):
         if user_id:
             try:
                 user = User.objects.get(pk=user_id)
-                # Wichtig: Sensible Daten (wie E-Mail) nicht unnötig exposen!
                 user_info = {
                     'pk': user.pk,
                     'username': user.username,
@@ -112,10 +126,9 @@ class LoanPlugin(InvenTreePlugin, ActionMixin, UserInterfaceMixin):
                 }
             except User.DoesNotExist:
                 logger.warning(f"Loaned user with ID {user_id} not found for StockItem {item.pk}")
-                # Bereinige ungültige Metadaten?
                 item.delete_metadata(METADATA_LOAN_USER_KEY)
                 item.delete_metadata(METADATA_LOAN_DUE_DATE_KEY)
-                user_id = None # Setze zurück, damit Status korrekt ist
+                user_id = None
                 due_date = None
 
         return {
@@ -134,6 +147,7 @@ class LoanPlugin(InvenTreePlugin, ActionMixin, UserInterfaceMixin):
         item.set_metadata(METADATA_LOAN_DUE_DATE_KEY, due_date.isoformat(), change_tracked=True)
         item.save()
         logger.info(f"StockItem {item.pk} loaned to user {user.pk} until {due_date.isoformat()}")
+        # Wichtig für Action API: Gib Status für JS-Update zurück
         return {"success": True, "message": f"Item loaned to {user.username} until {due_date.isoformat()}", "loan_status": self.get_loan_status(item)}
 
     def perform_return(self, item: StockItem, requesting_user: User):
@@ -142,7 +156,6 @@ class LoanPlugin(InvenTreePlugin, ActionMixin, UserInterfaceMixin):
         if not loaned_user_id:
             raise ValidationError(f"Item '{item}' is not currently loaned out.")
 
-        # Berechtigungsprüfung: Nur der Ausleihende oder Staff darf zurückgeben
         if not (requesting_user.pk == loaned_user_id or requesting_user.is_staff):
              raise ValidationError("You do not have permission to return this item.")
 
@@ -150,18 +163,18 @@ class LoanPlugin(InvenTreePlugin, ActionMixin, UserInterfaceMixin):
         item.delete_metadata(METADATA_LOAN_DUE_DATE_KEY)
         item.save()
         logger.info(f"StockItem {item.pk} returned by user {requesting_user.pk}")
+        # Wichtig für Action API: Gib Status für JS-Update zurück
         return {"success": True, "message": "Item returned successfully.", "loan_status": self.get_loan_status(item)}
 
 
-    # --- ActionMixin Implementierung ---
+    # --- ActionMixin Implementierung (bleibt gleich) ---
     def perform_action(self, user: User, data=None):
         """
         Führt die 'manage_loan' Aktion aus.
-        Unterscheidet zwischen 'loan' und 'return' basierend auf 'data'.
         """
         stock_item_pk = data.get('stock_item_pk', None)
         loan_action = data.get('loan_action', None)
-        result = {} # Das wird an das Frontend zurückgegeben
+        result = {}
 
         if not stock_item_pk or not loan_action:
             raise ValidationError("Missing required arguments: stock_item_pk and loan_action")
@@ -170,9 +183,7 @@ class LoanPlugin(InvenTreePlugin, ActionMixin, UserInterfaceMixin):
             item = StockItem.objects.get(pk=stock_item_pk)
 
             if loan_action == 'loan':
-                # Wer leiht aus? Standardmäßig der anfragende User
-                # target_user_pk = data.get('target_user_pk', user.pk) # Für Admin-Override
-                target_user = user # Vereinfacht: Nur an sich selbst ausleihen
+                target_user = user
                 result = self.perform_loan(item, target_user)
 
             elif loan_action == 'return':
@@ -184,20 +195,18 @@ class LoanPlugin(InvenTreePlugin, ActionMixin, UserInterfaceMixin):
         except StockItem.DoesNotExist:
             raise ValidationError(f"StockItem with pk={stock_item_pk} not found.")
         except User.DoesNotExist:
-            # Relevant, wenn target_user_pk verwendet wird
             raise ValidationError(f"Target user not found.")
         except ValidationError as e:
-            # Bestehende Validierungsfehler weitergeben
             raise e
         except Exception as e:
             logger.error(f"Error in manage_loan action: {e}")
             raise ValidationError(f"An unexpected error occurred: {e}")
 
-        return result
+        # Stelle sicher, dass das Ergebnis für die Action API geeignet ist
+        # Füge standardmäßig success=False hinzu, falls nicht gesetzt
+        if 'success' not in result:
+            result['success'] = False
+        if 'message' not in result and not result['success']:
+             result['message'] = "Action failed." # Standardfehlermeldung
 
-    # Optional: get_info & get_result können angepasst werden, aber für den Start nicht nötig
-    # def get_info(self, user, data=None):
-    #    return {"info": "Manages loan status for a stock item."}
-
-    # def get_result(self, user, data=None, result=None):
-    #    return result # Gibt das Ergebnis von perform_action zurück
+        return result # Wird als JSON von der Action API zurückgegeben

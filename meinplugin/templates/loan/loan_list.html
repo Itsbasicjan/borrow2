@@ -1,0 +1,198 @@
+{% extends "page_base.html" %}
+{% load static %}
+{% load i18n %}
+{% load inventree_extras %}
+{% load plugin_extras %}
+
+{% block title %}{% trans "Loanable Stock Items" %} - {{ block.super }}{% endblock title %}
+
+{% block page_content %}
+<div class="container-fluid">
+    <h2>{% trans "Loanable Stock Items" %}</h2>
+    <p>{% trans "Manage loan status for available stock items." %}</p>
+
+    <div id="loan-global-message" class="mt-2"></div>
+
+    <table class="table table-striped table-hover table-condensed">
+        <thead>
+            <tr>
+                <th>{% trans "Part" %}</th>
+                <th>{% trans "Stock Item" %}</th>
+                <th>{% trans "Location" %}</th>
+                <th>{% trans "Quantity" %}</th>
+                <th>{% trans "Status" %}</th>
+                <th>{% trans "Actions" %}</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for item_data in items %}
+            {% with item=item_data.item status=item_data.loan_status %}
+            <tr id="loan-row-{{ item.pk }}">
+                <td>
+                    <a href="{% url 'part-detail' item.part.pk %}">{{ item.part.full_name }}</a>
+                    {% if item.part.description %}<small class="d-block text-muted">{{ item.part.description }}</small>{% endif %}
+                </td>
+                <td>
+                     <a href="{% url 'stock-item-detail' item.pk %}">#{{ item.pk }}</a>
+                     {% if item.serial %}({{ item.serial }}){% endif %}
+                </td>
+                 <td>{% if item.location %}<a href="{% url 'stock-location-detail' item.location.pk %}">{{ item.location.name }}</a>{% else %}-{% endif %}</td>
+                <td>{{ item.quantity|decimal }} {% if item.part.units %}{{ item.part.units }}{% endif %}</td>
+                <td class="loan-status-cell">
+                    {% if status.is_loaned %}
+                        {% blocktrans with username=status.loaned_to.username %}Loaned to {{ username }}{% endblocktrans %}
+                        {% if status.due_date %}<br><small>({% trans "Due" %}: {{ status.due_date }})</small>{% endif %}
+                    {% else %}
+                        <span class="badge bg-success">{% trans "Available" %}</span>
+                    {% endif %}
+                </td>
+                <td class="loan-action-cell">
+                    {% if status.is_loaned %}
+                        {% if status.loaned_to.pk == requesting_user_pk or can_manage_stock %}
+                            <button class="btn btn-warning btn-sm btn-return" data-item-pk="{{ item.pk }}">
+                                <span class="fas fa-undo"></span> {% trans "Return" %}
+                            </button>
+                        {% else %}
+                             <button class="btn btn-secondary btn-sm" disabled title="{% trans 'Loaned by another user' %}">
+                                <span class="fas fa-undo"></span> {% trans "Return" %}
+                            </button>
+                        {% endif %}
+                    {% else %}
+                         {% if can_manage_stock %} {# Oder spezifischere Berechtigung prüfen #}
+                            <button class="btn btn-success btn-sm btn-loan" data-item-pk="{{ item.pk }}">
+                                <span class="fas fa-hand-holding-box"></span> {% trans "Loan (to me)" %}
+                            </button>
+                        {% else %}
+                             <button class="btn btn-secondary btn-sm" disabled title="{% trans 'No permission to loan' %}">
+                                <span class="fas fa-hand-holding-box"></span> {% trans "Loan" %}
+                            </button>
+                        {% endif %}
+                    {% endif %}
+                </td>
+            </tr>
+            {% endwith %}
+            {% empty %}
+            <tr>
+                <td colspan="6"><em>{% trans "No stock items found." %}</em></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock page_content %}
+
+{% block js_ready %}
+{{ block.super }}
+<script>
+    /* Loan Plugin Page JavaScript */
+
+    function showGlobalMessage(text, isError = false) {
+        const messageDiv = document.getElementById('loan-global-message');
+        if (messageDiv) {
+            messageDiv.innerHTML = `<div class="alert ${isError ? 'alert-danger' : 'alert-success'}">${text}</div>`;
+            // Optional: Nach einiger Zeit ausblenden
+            // setTimeout(() => { messageDiv.innerHTML = ''; }, 5000);
+        }
+    }
+
+    async function handleLoanAction(itemId, actionType) {
+        showGlobalMessage('Processing...', false); // Ladeanzeige
+
+        const url = `/api/action/`;
+        const payload = {
+            action: 'manage_loan',
+            data: {
+                stock_item_pk: itemId,
+                loan_action: actionType,
+            }
+        };
+
+        try {
+            // inventreeFormDataUpload ist eine globale Hilfsfunktion
+            const response = await inventreeFormDataUpload(url, payload, { method: 'POST' });
+
+            if (response.success) {
+                showGlobalMessage(response.message || `${actionType} successful!`);
+                // Update UI für die spezifische Zeile
+                updateTableRow(itemId, response.loan_status);
+            } else {
+                showGlobalMessage(response.error || response.message || `Failed to ${actionType} item.`, true);
+                console.error("Loan action failed:", response);
+            }
+        } catch (error) {
+            console.error("Error performing loan action:", error);
+            showGlobalMessage(`Network or server error performing ${actionType}. Check console.`, true);
+        }
+    }
+
+    // Funktion zum Aktualisieren einer Tabellenzeile nach einer Aktion
+    function updateTableRow(itemId, newStatus) {
+        const row = document.getElementById(`loan-row-${itemId}`);
+        if (!row) return;
+
+        const statusCell = row.querySelector('.loan-status-cell');
+        const actionCell = row.querySelector('.loan-action-cell');
+        const requestingUserPk = {{ requesting_user_pk }}; // Kommt vom Django Context
+        const canManageStock = {{ can_manage_stock|yesno:"true,false" }}; // Kommt vom Django Context
+
+        // Status Zelle aktualisieren
+        if (newStatus.is_loaned) {
+            const loanedTo = newStatus.loaned_to;
+            const userName = loanedTo ? `${loanedTo.first_name || ''} ${loanedTo.last_name || ''} (${loanedTo.username})`.trim() : `User ID ${loanedTo ? loanedTo.pk : 'Unknown'}`;
+            const dueDate = newStatus.due_date ? `<br><small>(Due: ${newStatus.due_date})</small>` : '';
+            statusCell.innerHTML = `Loaned to ${userName}${dueDate}`;
+        } else {
+            statusCell.innerHTML = `<span class="badge bg-success">Available</span>`;
+        }
+
+        // Action Zelle aktualisieren
+        actionCell.innerHTML = ''; // Leeren
+        if (newStatus.is_loaned) {
+            const loanedToPk = newStatus.loaned_to ? newStatus.loaned_to.pk : null;
+            if (loanedToPk === requestingUserPk || canManageStock) {
+                actionCell.innerHTML = `<button class="btn btn-warning btn-sm btn-return" data-item-pk="${itemId}"><span class="fas fa-undo"></span> Return</button>`;
+            } else {
+                 actionCell.innerHTML = `<button class="btn btn-secondary btn-sm" disabled title="Loaned by another user"><span class="fas fa-undo"></span> Return</button>`;
+            }
+        } else {
+             if (canManageStock) {
+                actionCell.innerHTML = `<button class="btn btn-success btn-sm btn-loan" data-item-pk="${itemId}"><span class="fas fa-hand-holding-box"></span> Loan (to me)</button>`;
+             } else {
+                actionCell.innerHTML = `<button class="btn btn-secondary btn-sm" disabled title="No permission to loan"><span class="fas fa-hand-holding-box"></span> Loan</button>`;
+             }
+        }
+
+        // Event Listener neu hinzufügen (oder Event Delegation verwenden)
+        addEventListenersToActionButtons(); // Sicherstellen, dass neue Buttons funktionieren
+    }
+
+
+    function addEventListenersToActionButtons() {
+        document.querySelectorAll('.btn-loan').forEach(button => {
+            // Entferne alte Listener, falls vorhanden (einfacher Ansatz)
+             button.replaceWith(button.cloneNode(true));
+        });
+         document.querySelectorAll('.btn-return').forEach(button => {
+             button.replaceWith(button.cloneNode(true));
+         });
+
+        // Füge neue Listener hinzu
+        document.querySelectorAll('.btn-loan').forEach(button => {
+            button.addEventListener('click', (event) => {
+                const itemId = event.currentTarget.getAttribute('data-item-pk');
+                handleLoanAction(itemId, 'loan');
+            });
+        });
+         document.querySelectorAll('.btn-return').forEach(button => {
+             button.addEventListener('click', (event) => {
+                 const itemId = event.currentTarget.getAttribute('data-item-pk');
+                 handleLoanAction(itemId, 'return');
+             });
+         });
+    }
+
+    // Initiale Event Listener beim Laden der Seite hinzufügen
+    addEventListenersToActionButtons();
+
+</script>
+{% endblock js_ready %}
