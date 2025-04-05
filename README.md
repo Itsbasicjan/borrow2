@@ -29,3 +29,4 @@ pip install meinplugin
 # inventree
 # borrow
 # borrow
+# borrow2
